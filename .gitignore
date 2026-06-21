@@ -1,0 +1,28 @@
+# Keil MDK build output
+Objects/
+Listings/
+
+# Build intermediates
+*.o
+*.d
+*.axf
+*.hex
+*.bin
+*.map
+*.sct
+*.lst
+*.crf
+*.htm
+*.dep
+*.lnp
+
+# IDE files
+*.uvguix.*
+*.scvd
+*.uvguix
+JLinkLog.txt
+*.JLink
+
+# OS
+.DS_Store
+Thumbs.db
