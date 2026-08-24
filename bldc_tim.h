@@ -4,7 +4,7 @@
  * @version     V1.1
  * @date        2025-12-28
  * @brief       定时器 驱动程序
- * @license     Copyright (c) 20260206, 湖南大学机电工程学院
+ * @license     Copyright (c) 20260206
  *
  * 实验平台:正点原子STM32F1精英开发板ATK-PD6010B电机驱动板
  *
