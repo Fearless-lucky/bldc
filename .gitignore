@@ -1,0 +1,30 @@
+# Keil MDK build artifacts
+Objects/
+Listings/
+*.o
+*.d
+*.crf
+*.htm
+*.lst
+*.axf
+*.hex
+*.map
+*.dep
+*.lnp
+*.iex
+*.sct
+*.uvguix.*
+
+# Debug configs (user-specific)
+DebugConfig/
+RTE/
+
+# Keil user interface state
+*.uvguix.*
+*.uvoptx
+*.bak
+*.scvd
+
+# OS
+Thumbs.db
+.DS_Store
