@@ -27,6 +27,9 @@ u16 arr = 7199, psc = 0;
 float T0 = 0, T1 = 0, T2 = 0;
 float Udc = 24.0f;
 
+/* 前馈差分基线复位标志: 轨迹重规划时置1, 主循环首拍消费后清零 */
+uint8_t ff_reset_req = 0;
+
 Trajectory_t traj[2];
 uint32_t sys_tick = 0;
 
@@ -54,9 +57,14 @@ void dlog_freeze(void)
     dlog_enable = 0;    /* 停止采样, 保留故障现场供 DUMP 导出 */
 }
 
+void dlog_resume(void)
+{
+    dlog_enable = 1;    /* 恢复采样(故障处理完毕后) */
+}
+
 void dlog_dump(void)
 {
-    /* 按时间顺序导出: 从最旧到最新 */
+    /* 按时间顺序导出: 从最旧到最新; 导出后自动恢复采样 */
     char buf[72];
     uint8_t i;
     UART_SendString("!LOG\r\n");
@@ -74,6 +82,7 @@ void dlog_dump(void)
         UART_SendString(buf);
     }
     UART_SendString("!LOGEND\r\n");
+    dlog_enable = 1;    /* 导出即处理完毕, 恢复采样 */
 }
 
 static void dlog_sample(void)
@@ -282,13 +291,28 @@ int main(void)
 
         /* ---- 挡板轨迹跟踪 + 位置环 + 前馈 + 堵转/过流保护 + 日志采样 ---- */
         if (motor[1].state == MOTOR_RUN) {
-            /* 轨迹前馈数据: v_ff/a_ff 由轨迹相位计算(简化差分) */
+            /* 轨迹前馈数据: v_ff/a_ff 由轨迹相位计算(简化差分)
+             * 首拍跳过差分(避免与上段轨迹/静止位置的伪差分产生巨大加速度) */
             {
                 static float last_ref = 0;
+                static uint8_t ff_init = 0;
                 float ref_pos = traj_step(&traj[1]);
-                float v_now = (ref_pos - last_ref) * 1000.0f;      /* counts/s */
-                motor[1].a_ff = (v_now - motor[1].v_ff) * 1000.0f; /* counts/s^2 */
-                motor[1].v_ff = v_now;
+                if (ff_reset_req) {
+                    /* 新轨迹首拍: 速度/加速度前馈从0起(轨迹本身从静止/当前速度平滑加速) */
+                    motor[1].v_ff = 0.0f;
+                    motor[1].a_ff = 0.0f;
+                    ff_init = 1;
+                    ff_reset_req = 0;
+                }
+                if (ff_init) {
+                    float v_now = (ref_pos - last_ref) * 1000.0f;      /* counts/s */
+                    motor[1].a_ff = (v_now - motor[1].v_ff) * 1000.0f; /* counts/s^2 */
+                    motor[1].v_ff = v_now;
+                } else {
+                    motor[1].v_ff = 0.0f;
+                    motor[1].a_ff = 0.0f;
+                    ff_init = 1;
+                }
                 last_ref = ref_pos;
                 motor[1].target_pos = (int32_t)ref_pos;
             }

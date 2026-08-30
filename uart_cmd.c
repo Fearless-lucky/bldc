@@ -160,23 +160,33 @@ extern uint32_t sys_tick;
 
 /* 命令层保护轮询: 主循环调用
  * - 连续3次非法命令 -> 熔断(两电机停机, 拒绝后续命令直到 RST)
- * - 30s 无合法命令且电机在运行 -> 超时安全停机(防上位机失联后电机裸奔) */
+ * - 30s 无合法命令且系统处于"运行但无自主活动"状态 -> 超时安全停机
+ *   (挡板轨迹执行/队列/传送带转动均属自主活动, 不算失联) */
 void cmd_guard_poll(void)
 {
     if (fuse_tripped) return;
 
     if (sys_tick - last_legal_tick > CMD_TIMEOUT_MS) {
-        /* 超时: 电机仍在运行则安全停机(不动处于静止的系统) */
-        if (motor1.run_flag == RUN) {
-            stop_motor1();
-            motor1.run_flag = STOP;
-            UART_SendString("!TIMEOUT,CSTOP\r\n");
+        uint8_t active = 0;
+
+        /* 传送带在转: 自主活动 */
+        if (motor1.run_flag == RUN && motor1.speed > 10) active = 1;
+        /* 挡板轨迹执行中/队列有挂起/未到位: 自主活动 */
+        if (traj[1].running || gate_queue_len() > 0 || gate_busy()) active = 1;
+
+        if (!active) {
+            /* 真正失联且电机带电: 安全停机 */
+            if (motor1.run_flag == RUN) {
+                stop_motor1();
+                motor1.run_flag = STOP;
+                UART_SendString("!TIMEOUT,CSTOP\r\n");
+            }
+            if (motor[1].state == MOTOR_RUN) {
+                Motor_Stop(&motor[1]);
+                UART_SendString("!TIMEOUT,GSTOP\r\n");
+            }
         }
-        if (motor[1].state == MOTOR_RUN) {
-            Motor_Stop(&motor[1]);
-            UART_SendString("!TIMEOUT,GSTOP\r\n");
-        }
-        last_legal_tick = sys_tick;   /* 避免重复上报 */
+        last_legal_tick = sys_tick;   /* 本轮检查完毕, 重置计时 */
     }
 }
 
@@ -212,8 +222,11 @@ static void gate_parse(char *p)
 {
     if (strstr(p, "STOP")) {
         Motor_Stop(&motor[1]);
-        /* 故障恢复: 堵转/过流保护会关断TIM8与驱动器, STOP后重新使能(占空比已为零) */
+        /* 故障恢复: 堵转/过流保护会关断TIM8与驱动器, STOP后重新使能(占空比已为零)
+         * 注意: DUMP应在STOP前执行以导出冻结的故障现场 */
         motor[1].fault_code = FAULT_NONE;
+        motor[1].oc_ms = 0;
+        motor[1].stall_ms = 0;
         TIM_Cmd(TIM8, ENABLE);
         TIM_CtrlPWMOutputs(TIM8, ENABLE);
         GPIO_WriteBit(AXIS2_SD_PORT, AXIS2_SD_PIN, Bit_SET);
@@ -245,7 +258,7 @@ static void gate_parse(char *p)
                 gate_move_to_label(1, (uint8_t)label)) {
                 gate_send_reply();
             } else {
-                UART_SendString("ERR:label\r\n");
+                UART_SendString("ERR:label\r\n"); cmd_guard_illegal();
             }
         } else if (cmd == 'P') {
             /* "#1 PID 0 0.2 0.001 [kd]": 在线修改环路增益(kd可选) */
@@ -263,7 +276,7 @@ static void gate_parse(char *p)
                 loops[loop]->integral = 0.0f;
                 gate_send_reply();
             } else {
-                UART_SendString("ERR:pid\r\n");
+                UART_SendString("ERR:pid\r\n"); cmd_guard_illegal();
             }
         } else if (cmd == 'T') {
             /* "#1 TEST 5": 固定负载下重复相同位置命令5次 */
@@ -272,7 +285,7 @@ static void gate_parse(char *p)
                 runs >= 1 && runs <= 50) {
                 sorter_test_start(1, (uint8_t)runs);
             } else {
-                UART_SendString("ERR:test\r\n");
+                UART_SendString("ERR:test\r\n"); cmd_guard_illegal();
             }
         } else if (cmd == 'L') {
             /* "#1 LOG 1": 手动开/关遥测流 */
@@ -281,7 +294,7 @@ static void gate_parse(char *p)
                 sorter_log_ctrl(1, (uint8_t)on);
                 gate_send_reply();
             } else {
-                UART_SendString("ERR:log\r\n");
+                UART_SendString("ERR:log\r\n"); cmd_guard_illegal();
             }
         } else {
             /* "#1 1000 300": 目标位置 + 轨迹速度(空闲即执行, 运动中入队) */
@@ -290,7 +303,7 @@ static void gate_parse(char *p)
             int n = sscanf(p + 3, "%d %f", &pos, &speed);
             if (n >= 1) {
                 if (abs(pos) > POS_LIMIT) {
-                    UART_SendString("ERR:limit\r\n");
+                    UART_SendString("ERR:limit\r\n"); cmd_guard_illegal();
                     return;
                 }
                 if (gate_queue_move(1, pos, speed)) {
@@ -299,7 +312,7 @@ static void gate_parse(char *p)
                     UART_SendString("#1 BUSY\r\n");   /* 队列满 */
                 }
             } else {
-                UART_SendString("ERR:fmt\r\n");
+                UART_SendString("ERR:fmt\r\n"); cmd_guard_illegal();
             }
         }
     }
@@ -338,21 +351,19 @@ static void conv_parse(char *p)
         dlog_dump();
     } else if (strncmp(p, "SYNC", 4) == 0) {
         /* 双轴同步命令: "SYNC <label>": 挡板转到标签角度且传送带同时启动
-         * 实现: 传送带立即RUN, 挡板轨迹启动; 联动层自动在挡板动作期间限速,
+         * 实现: 先确认挡板可执行(否则不动传送带, 避免半执行状态),
+         * 再启动传送带并下发挡板轨迹; 联动层在挡板动作期间自动限速,
          * 到位(!DONE1)后传送带恢复全速 -> 两轴在时间上受控衔接 */
         int label = 0;
-        if (sscanf(p, "SYNC %d", &label) == 1 && label >= 1 && label <= 8) {
+        if (sscanf(p, "SYNC %d", &label) == 1 && label >= 1 && label <= 8
+            && gate_move_to_label(1, (uint8_t)label)) {
             if (motor1.run_flag != RUN) {
                 motor1.run_flag = RUN;
                 start_motor1();
                 UVW_6_Step_Ponoff();
                 TIM_GenerateEvent(TIM1, TIM_EventSource_COM);
             }
-            if (gate_move_to_label(1, (uint8_t)label)) {
-                UART_SendString("OK:sync\r\n");
-            } else {
-                UART_SendString("ERR:sync\r\n");
-            }
+            UART_SendString("OK:sync\r\n");
         } else {
             UART_SendString("ERR:sync\r\n");
         }
@@ -434,7 +445,11 @@ static void parse_and_execute(void)
 
     if (p[0] == '#') {
         uint8_t axis = p[1] - '0';
-        if (axis != 1) { UART_SendString("ERR:axis\r\n"); return; }
+        if (axis != 1) {
+            UART_SendString("ERR:axis\r\n");
+            cmd_guard_illegal();
+            return;
+        }
         gate_parse(p);
     } else {
         conv_parse(p);

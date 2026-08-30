@@ -6,6 +6,7 @@
 
 extern Trajectory_t traj[2];
 extern uint32_t sys_tick;
+extern uint8_t ff_reset_req;   /* 定义于svpwm_main.c: 轨迹重规划时复位前馈差分基线 */
 
 /* 视觉标签 -> 挡板目标角度(度)查找表, 标签1~8对应8个分拣流向 */
 static const uint16_t gate_label_angle[GATE_LABEL_NUM] = {
@@ -53,6 +54,7 @@ static void gate_execute(int32_t pos, float speed)
     Motor_SetTarget(&motor[1], pos);
     traj_plan(&traj[1], (float)pos, (float)motor[1].pos, speed, GATE_MOVE_ACCEL);
     ginpos.done_reported = 0;   /* 新运动开始, 允许再次上报 */
+    ff_reset_req = 1;           /* 复位前馈差分基线 */
 }
 
 /*====================================================================
@@ -122,7 +124,9 @@ uint8_t gate_in_position(void)
 
 uint8_t gate_busy(void)
 {
-    /* 轨迹执行中 / 未到位 / 队列有挂起命令 */
+    /* 运行态下: 轨迹执行中 / 未到位 / 队列有挂起命令
+     * (对齐/停止/故障态不算busy: 上电对齐期间不应触发传送带联动限速) */
+    if (motor[1].state != MOTOR_RUN) return 0;
     return (uint8_t)(traj[1].running || !ginpos.in_pos || gq_len > 0);
 }
 
@@ -188,6 +192,7 @@ static void test_issue_cmd(uint8_t axis, int32_t pos)
     Motor_SetTarget(&motor[axis], pos);
     traj_plan(&traj[axis], (float)pos, (float)motor[axis].pos,
               GATE_V_MAX, GATE_MOVE_ACCEL);
+    if (axis == 1) ff_reset_req = 1;
 }
 
 void sorter_test_start(uint8_t axis, uint8_t runs)
@@ -226,6 +231,8 @@ static void test_finish(uint8_t axis)
 {
     stest[axis].active = 0;
     stest[axis].log_en = 0;
+    /* 中止/结束时清空挂起队列, 防止残留命令在测试后突然执行 */
+    gq_head = gq_tail = gq_len = 0;
     char buf[32];
     sprintf(buf, "!TDONE%d\r\n", axis);
     UART_SendString(buf);
