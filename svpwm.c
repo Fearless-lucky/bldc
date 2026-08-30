@@ -82,6 +82,11 @@ void Motor_Init(Motor_t *m, TIM_TypeDef *tim_pwm, TIM_TypeDef *tim_enc, uint8_t 
     m->i_offset_b = 0.0f;
     m->stall_ms = 0;
     m->stall_last_pos = 0;
+    m->v_ff = 0.0f;
+    m->a_ff = 0.0f;
+    m->oc_ms = 0;
+    m->enc_dir = 1;
+    m->fault_code = FAULT_NONE;
 
     PID_Init(&m->pid_c_d, 0.5f, 0.01f, 0.0f, 12.0f);
     PID_Init(&m->pid_c_q, 0.5f, 0.01f, 0.0f, 12.0f);
@@ -127,8 +132,12 @@ void Motor_SetTarget(Motor_t *m, int32_t pos)
 void Motor_SpeedLoop(Motor_t *m, float dt)
 {
     if (m->state != MOTOR_RUN) return;
-    /* 输出为q轴电流给定(安培), 限幅I_MAX */
-    m->iq_ref = PID_Calc(&m->pid_speed, (float)m->speed_ref, (float)m->speed_rpm, dt);
+
+    /* 反馈控制 + 加速度前馈: 轨迹规划加速度直接前馈到q轴电流
+     * 减小跟踪滞后, 位置环同理有速度前馈 */
+    float fb = PID_Calc(&m->pid_speed, (float)m->speed_ref, (float)m->speed_rpm, dt);
+    float ff = FF_ACC_KT * m->a_ff;
+    m->iq_ref = fb + ff;
     if (m->iq_ref > I_MAX) m->iq_ref = I_MAX;
     if (m->iq_ref < -I_MAX) m->iq_ref = -I_MAX;
 }
@@ -136,7 +145,13 @@ void Motor_SpeedLoop(Motor_t *m, float dt)
 void Motor_PositionLoop(Motor_t *m)
 {
     if (m->state != MOTOR_RUN) return;
-    m->speed_ref = (int16_t)PID_Calc(&m->pid_pos, (float)m->target_pos, (float)m->pos, 0.01f);
+    /* 位置误差PID + 轨迹速度前馈: 跟随误差显著减小 */
+    float fb = PID_Calc(&m->pid_pos, (float)m->target_pos, (float)m->pos, 0.01f);
+    float ff = FF_VEL_KP * m->v_ff * 0.06f;   /* counts/s -> rpm 近似换算(2000计数/转) */
+    float out = fb + ff;
+    if (out > 1500.0f) out = 1500.0f;
+    if (out < -1500.0f) out = -1500.0f;
+    m->speed_ref = (int16_t)out;
 }
 
 void Motor_Stop(Motor_t *m)
@@ -159,6 +174,14 @@ void Motor_Fault(Motor_t *m)
     /* 挡板电机: 同时切断驱动器使能, 双重保护 */
     if (m->tim_pwm == TIM8) {
         GPIO_WriteBit(AXIS2_SD_PORT, AXIS2_SD_PIN, Bit_RESET);
+    }
+}
+
+void Motor_SetFault(Motor_t *m, uint8_t code)
+{
+    if (m->state != MOTOR_FAULT) {
+        m->fault_code = code;
+        Motor_Fault(m);
     }
 }
 

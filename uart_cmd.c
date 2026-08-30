@@ -148,6 +148,56 @@ void UART_SendString(char *str)
     USART_ITConfig(USART2, USART_IT_TXE, ENABLE);
 }
 
+/*==================== 命令层保护: 熔断 + 超时 ====================*/
+
+#define CMD_ILLEGAL_LIMIT   3       /* 连续非法命令次数上限 */
+#define CMD_TIMEOUT_MS      30000UL /* 命令活动超时: 30s无合法命令进入安全态 */
+
+static uint8_t illegal_cnt = 0;         /* 连续非法命令计数 */
+static uint8_t fuse_tripped = 0;        /* 熔断标志: 进入安全模式 */
+static uint32_t last_legal_tick = 0;    /* 最近一次合法命令时刻 */
+extern uint32_t sys_tick;
+
+/* 命令层保护轮询: 主循环调用
+ * - 连续3次非法命令 -> 熔断(两电机停机, 拒绝后续命令直到 RST)
+ * - 30s 无合法命令且电机在运行 -> 超时安全停机(防上位机失联后电机裸奔) */
+void cmd_guard_poll(void)
+{
+    if (fuse_tripped) return;
+
+    if (sys_tick - last_legal_tick > CMD_TIMEOUT_MS) {
+        /* 超时: 电机仍在运行则安全停机(不动处于静止的系统) */
+        if (motor1.run_flag == RUN) {
+            stop_motor1();
+            motor1.run_flag = STOP;
+            UART_SendString("!TIMEOUT,CSTOP\r\n");
+        }
+        if (motor[1].state == MOTOR_RUN) {
+            Motor_Stop(&motor[1]);
+            UART_SendString("!TIMEOUT,GSTOP\r\n");
+        }
+        last_legal_tick = sys_tick;   /* 避免重复上报 */
+    }
+}
+
+static void cmd_guard_legal(void)
+{
+    illegal_cnt = 0;
+    last_legal_tick = sys_tick;
+}
+
+static void cmd_guard_illegal(void)
+{
+    if (++illegal_cnt >= CMD_ILLEGAL_LIMIT) {
+        fuse_tripped = 1;
+        /* 熔断: 两电机全部安全停机 */
+        stop_motor1();
+        motor1.run_flag = STOP;
+        Motor_Stop(&motor[1]);
+        UART_SendString("!FUSE\r\n");
+    }
+}
+
 /*==================== 挡板电机命令(FOC/SVPWM) ====================*/
 
 static void gate_send_reply(void)
@@ -162,11 +212,21 @@ static void gate_parse(char *p)
 {
     if (strstr(p, "STOP")) {
         Motor_Stop(&motor[1]);
-        /* 故障恢复: 堵转保护会关断TIM8与驱动器, STOP后重新使能(占空比已为零) */
+        /* 故障恢复: 堵转/过流保护会关断TIM8与驱动器, STOP后重新使能(占空比已为零) */
+        motor[1].fault_code = FAULT_NONE;
         TIM_Cmd(TIM8, ENABLE);
         TIM_CtrlPWMOutputs(TIM8, ENABLE);
         GPIO_WriteBit(AXIS2_SD_PORT, AXIS2_SD_PIN, Bit_SET);
         gate_send_reply();
+    } else if (strstr(p, "FAULT")) {
+        /* "#1 FAULT?": 查询当前故障码 */
+        char buf[32];
+        if (motor[1].state == MOTOR_FAULT) {
+            sprintf(buf, "#1 F=0x%02X\r\n", motor[1].fault_code);
+        } else {
+            sprintf(buf, "#1 F=OK\r\n");
+        }
+        UART_SendString(buf);
     } else if (strstr(p, "CAL") || strstr(p, "HOME")) {
         /* 转子对齐, 对齐完成后自动捕获电角度零点 */
         motor[1].state = MOTOR_ALIGN;
@@ -224,7 +284,7 @@ static void gate_parse(char *p)
                 UART_SendString("ERR:log\r\n");
             }
         } else {
-            /* "#1 1000 300": 目标位置 + 轨迹速度, 梯形轨迹执行 */
+            /* "#1 1000 300": 目标位置 + 轨迹速度(空闲即执行, 运动中入队) */
             int32_t pos = 0;
             float speed = 200.0f;
             int n = sscanf(p + 3, "%d %f", &pos, &speed);
@@ -233,9 +293,11 @@ static void gate_parse(char *p)
                     UART_SendString("ERR:limit\r\n");
                     return;
                 }
-                Motor_SetTarget(&motor[1], pos);
-                traj_plan(&traj[1], (float)pos, (float)motor[1].pos, speed, 500.0f);
-                gate_send_reply();
+                if (gate_queue_move(1, pos, speed)) {
+                    gate_send_reply();
+                } else {
+                    UART_SendString("#1 BUSY\r\n");   /* 队列满 */
+                }
             } else {
                 UART_SendString("ERR:fmt\r\n");
             }
@@ -265,7 +327,36 @@ static void conv_parse(char *p)
         return;
     }
 
-    if (strstr(p, "RUN")) {
+    if (strncmp(p, "RST", 3) == 0) {
+        /* 熔断复位: 清除安全模式(电机保持停止, 需重新下达运动命令) */
+        illegal_cnt = 0;
+        fuse_tripped = 0;
+        last_legal_tick = sys_tick;
+        UART_SendString("OK:rst\r\n");
+    } else if (strncmp(p, "DUMP", 4) == 0) {
+        /* 导出运行数据环形日志(故障回溯) */
+        dlog_dump();
+    } else if (strncmp(p, "SYNC", 4) == 0) {
+        /* 双轴同步命令: "SYNC <label>": 挡板转到标签角度且传送带同时启动
+         * 实现: 传送带立即RUN, 挡板轨迹启动; 联动层自动在挡板动作期间限速,
+         * 到位(!DONE1)后传送带恢复全速 -> 两轴在时间上受控衔接 */
+        int label = 0;
+        if (sscanf(p, "SYNC %d", &label) == 1 && label >= 1 && label <= 8) {
+            if (motor1.run_flag != RUN) {
+                motor1.run_flag = RUN;
+                start_motor1();
+                UVW_6_Step_Ponoff();
+                TIM_GenerateEvent(TIM1, TIM_EventSource_COM);
+            }
+            if (gate_move_to_label(1, (uint8_t)label)) {
+                UART_SendString("OK:sync\r\n");
+            } else {
+                UART_SendString("ERR:sync\r\n");
+            }
+        } else {
+            UART_SendString("ERR:sync\r\n");
+        }
+    } else if (strstr(p, "RUN")) {
         if (motor1.run_flag != RUN) {
             motor1.run_flag = RUN;
             start_motor1();
@@ -287,6 +378,8 @@ static void conv_parse(char *p)
         pb.conv_kp = Kp;
         pb.conv_ki = Ki;
         pb.conv_kd = Kd;
+        pb.adc_to_amp = (3.3f / (4096.0f * CURR_SENSE_R * CURR_AMP_GAIN));
+        pb.enc_dir = (motor[1].enc_dir >= 0) ? 1 : -1;
         UART_SendString(param_save(&pb) ? "OK:save\r\n" : "ERR:save\r\n");
     } else if (p[0] == 'S') {
         int rpm = 0;
@@ -355,8 +448,19 @@ void uart_poll(void)
         uint16_t len = rx_idx - 1;
         if (len < 1 || len > 40) {
             UART_SendString("ERR:len\r\n");
+            cmd_guard_illegal();
+        } else if (fuse_tripped) {
+            /* 熔断态: 只接受 RST */
+            UART_SendString("ERR:fuse\r\n");
+            if (strncmp((char *)rx_buf, "RST", 3) == 0) {
+                illegal_cnt = 0;
+                fuse_tripped = 0;
+                last_legal_tick = sys_tick;
+                UART_SendString("OK:rst\r\n");
+            }
         } else {
             parse_and_execute();
+            cmd_guard_legal();
         }
         rx_idx = 0;
         memset((void *)rx_buf, 0, UART_BUF_SIZE);
@@ -365,4 +469,7 @@ void uart_poll(void)
         rx_idx = 0;
         memset((void *)rx_buf, 0, UART_BUF_SIZE);
     }
+
+    /* 命令超时守卫(每次轮询检查, 内部按sys_tick判定) */
+    cmd_guard_poll();
 }

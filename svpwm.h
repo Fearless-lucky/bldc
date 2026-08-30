@@ -35,6 +35,21 @@
 #define STALL_ERR_COUNTS   1000    /* 位置误差超过该值且不动则计时 */
 #define STALL_TIME_MS      2000    /* 持续不动超过2s判定堵转 */
 
+/* 过流监测阈值 */
+#define OC_LEVEL_AMP       3.5f    /* 实测q轴电流超过该值(安培)计过流 */
+#define OC_TIME_MS         500     /* 持续超过500ms报过流故障 */
+
+/* 前馈增益(速度环加速度前馈, 位置环速度前馈) */
+#define FF_ACC_KT          0.005f  /* 加速度前馈系数: iq_ff = FF_ACC_KT * a */
+#define FF_VEL_KP          1.0f    /* 速度前馈系数: sp_ff = FF_VEL_KP * v_ref */
+
+/* ---------- 故障码体系 ---------- */
+#define FAULT_NONE         0x00
+#define FAULT_STALL        0x01    /* 挡板堵转 */
+#define FAULT_OC           0x02    /* 持续过流 */
+#define FAULT_HALL_LOST    0x10    /* 传送带Hall丢失(挡板轴视角) */
+#define FAULT_DRV          0x20    /* 驱动器故障输入 */
+
 typedef struct {
     float kp;
     float ki;
@@ -78,6 +93,13 @@ typedef struct {
     float i_offset_b;         /* B相电流采样零点偏置(ADC原始码) */
     uint16_t stall_ms;        /* 堵转计时 */
     int32_t stall_last_pos;   /* 堵转检测: 上次位置快照 */
+
+    /* 前馈与过流 */
+    float v_ff;               /* 轨迹瞬时速度(counts/s), 供速度前馈 */
+    float a_ff;               /* 轨迹瞬时加速度(counts/s^2), 供加速度前馈 */
+    uint16_t oc_ms;           /* 过流持续时间 */
+    uint8_t  enc_dir;         /* 编码器方向: +1或-1(自整定), 修正测速符号 */
+    uint8_t  fault_code;      /* 当前故障码(FAULT_xxx) */
 } Motor_t;
 
 typedef struct {
@@ -108,6 +130,7 @@ void Park(float ialpha, float ibeta, float theta, float *id, float *iq);
 void InvPark(float vd, float vq, float theta, float *valpha, float *vbeta);
 
 void Motor_Init(Motor_t *m, TIM_TypeDef *tim_pwm, TIM_TypeDef *tim_enc, uint8_t ch_a, uint8_t ch_b);
+void Motor_SetFault(Motor_t *m, uint8_t code);   /* 置故障码并切断(联动+过流+堵转共用) */
 void Motor_CurrentLoop(Motor_t *m);
 void Motor_SpeedLoop(Motor_t *m, float dt);
 void Motor_PositionLoop(Motor_t *m);

@@ -335,10 +335,11 @@ void TIM6_IRQHandler(void)
     static uint16_t enc1_last = 0;
     static uint8_t div100 = 0;
 
-    /* ---- 挡板速度: 每10ms, TIM2模60000差值, 2000计数/转 ---- */
+    /* ---- 挡板速度: 每10ms, TIM2模60000差值, 2000计数/转, 方向自整定系数修正 ---- */
     uint16_t enc1 = TIM_GetCounter(TIM2);
     int32_t d1 = enc_delta(enc1, enc1_last);
-    motor[1].speed_rpm = (int16_t)(60 * 100 * (motor[1].dir == CW ? d1 : -d1) / 2000);
+    int32_t d1s = (motor[1].enc_dir >= 0) ? d1 : -d1;   /* 编码器方向修正 */
+    motor[1].speed_rpm = (int16_t)(60 * 100 * (motor[1].dir == CW ? d1s : -d1s) / 2000);
     if (motor[1].speed_rpm < 0) motor[1].speed_rpm = 0;
     enc1_last = enc1;
 

@@ -12,7 +12,25 @@ static const uint16_t gate_label_angle[GATE_LABEL_NUM] = {
     0, 45, 90, 135, 180, 225, 270, 315
 };
 
-/* 调参验证测试序列状态 */
+/*---------- 到位判定状态 ----------*/
+typedef struct {
+    uint8_t  in_pos;        /* 当前判定为到位 */
+    uint16_t hold_ms;       /* 窗口内持续时间 */
+    uint8_t  done_reported; /* 本次运动的 !DONE 已上报(避免重复) */
+} InPos_t;
+
+static InPos_t ginpos;
+
+/*---------- 命令队列 ----------*/
+typedef struct {
+    int32_t pos;
+    float   speed;
+} GateCmd_t;
+
+static GateCmd_t gqueue[GATE_QUEUE_DEPTH];
+static uint8_t gq_head = 0, gq_tail = 0, gq_len = 0;
+
+/*---------- 调参验证测试序列状态 ----------*/
 typedef struct {
     uint8_t  active;       /* 测试进行中 */
     uint8_t  runs_total;   /* 重复次数 */
@@ -27,6 +45,60 @@ typedef struct {
 
 static SorterTest_t stest[2];
 
+/*====================================================================
+ * 内部: 执行一段轨迹(直接, 不经队列)
+ *====================================================================*/
+static void gate_execute(int32_t pos, float speed)
+{
+    Motor_SetTarget(&motor[1], pos);
+    traj_plan(&traj[1], (float)pos, (float)motor[1].pos, speed, GATE_MOVE_ACCEL);
+    ginpos.done_reported = 0;   /* 新运动开始, 允许再次上报 */
+}
+
+/*====================================================================
+ * 自适应轨迹: 按转动距离选取巡航速度
+ * 短程(45°, 250计数)用慢速防过冲, 长程(≥270°, 1500计数)用快速
+ * 中间线性插值
+ *====================================================================*/
+static float gate_adaptive_speed(int32_t from, int32_t to)
+{
+    int32_t dist = to - from;
+    if (dist < 0) dist = -dist;
+    if (dist > 1500) dist = 1500;
+    if (dist < 0) dist = 0;
+    return GATE_V_MIN + (GATE_V_MAX - GATE_V_MIN) * (float)dist / 1500.0f;
+}
+
+/*====================================================================
+ * 命令队列: 运动中收到新目标先挂起, 当前运动到位后依次执行
+ *====================================================================*/
+uint8_t gate_queue_move(uint8_t axis, int32_t pos, float speed)
+{
+    (void)axis;
+    if (gq_len >= GATE_QUEUE_DEPTH) return 0;
+
+    gqueue[gq_tail].pos = pos;
+    gqueue[gq_tail].speed = speed;
+    gq_tail = (uint8_t)((gq_tail + 1) % GATE_QUEUE_DEPTH);
+    gq_len++;
+    return 1;
+}
+
+uint8_t gate_queue_len(void)
+{
+    return gq_len;
+}
+
+/* 空闲(已到位且无队列)时立即执行, 否则入队 */
+static uint8_t gate_submit(int32_t pos, float speed)
+{
+    if (gate_in_position() && !traj[1].running) {
+        gate_execute(pos, speed);
+        return 1;
+    }
+    return gate_queue_move(1, pos, speed);
+}
+
 int32_t gate_label_to_counts(uint8_t label)
 {
     float angle = (float)gate_label_angle[label - 1];
@@ -38,23 +110,92 @@ uint8_t gate_move_to_label(uint8_t axis, uint8_t label)
     if (axis > 1 || label < 1 || label > GATE_LABEL_NUM) return 0;
 
     int32_t target = gate_label_to_counts(label);
-    Motor_SetTarget(&motor[axis], target);
-    /* 执行梯形速度轨迹, 位置与状态反馈由主循环闭环跟踪 */
-    traj_plan(&traj[axis], (float)target, (float)motor[axis].pos,
-              GATE_MOVE_SPEED, GATE_MOVE_ACCEL);
-    return 1;
+    /* 自适应速度: 按当前位置到标签角度的距离选取 */
+    float speed = gate_adaptive_speed(motor[1].pos, target);
+    return gate_submit(target, speed);
 }
 
+uint8_t gate_in_position(void)
+{
+    return ginpos.in_pos;
+}
+
+uint8_t gate_busy(void)
+{
+    /* 轨迹执行中 / 未到位 / 队列有挂起命令 */
+    return (uint8_t)(traj[1].running || !ginpos.in_pos || gq_len > 0);
+}
+
+uint8_t gate_fault(void)
+{
+    return (uint8_t)(motor[1].state == MOTOR_FAULT);
+}
+
+/*====================================================================
+ * 到位判定: 位置进入窗口并保持 GATE_INPOS_HOLD_MS 才算到位
+ *====================================================================*/
+static void inpos_poll(void)
+{
+    Motor_t *m = &motor[1];
+
+    if (m->state != MOTOR_RUN) {
+        ginpos.in_pos = 0;
+        ginpos.hold_ms = 0;
+        return;
+    }
+
+    int32_t err = m->target_pos - m->pos;
+    if (err < 0) err = -err;
+
+    if (!traj[1].running && err <= GATE_INPOS_WINDOW) {
+        if (ginpos.hold_ms < 60000) ginpos.hold_ms++;
+        if (ginpos.hold_ms >= GATE_INPOS_HOLD_MS) {
+            if (!ginpos.in_pos) {
+                ginpos.in_pos = 1;
+                /* 本次运动首次到达窗口: 上报到位事件 */
+                if (!ginpos.done_reported) {
+                    ginpos.done_reported = 1;
+                    UART_SendString("!DONE1\r\n");
+                }
+            }
+        }
+    } else {
+        /* 跟踪中: 位置环目标仍在变或误差超窗 */
+        ginpos.in_pos = 0;
+        ginpos.hold_ms = 0;
+    }
+}
+
+/*====================================================================
+ * 队列推进: 到位后自动执行下一条挂起命令
+ *====================================================================*/
+static void queue_poll(void)
+{
+    if (gq_len > 0 && ginpos.in_pos && !traj[1].running) {
+        GateCmd_t *c = &gqueue[gq_head];
+        gq_head = (uint8_t)((gq_head + 1) % GATE_QUEUE_DEPTH);
+        gq_len--;
+        gate_execute(c->pos, c->speed);
+    }
+}
+
+/*====================================================================
+ * 调参验证测试
+ *====================================================================*/
 static void test_issue_cmd(uint8_t axis, int32_t pos)
 {
+    /* 测试命令用固定速度(非自适应): 保证增益调整前后命令严格一致 */
     Motor_SetTarget(&motor[axis], pos);
     traj_plan(&traj[axis], (float)pos, (float)motor[axis].pos,
-              GATE_MOVE_SPEED, GATE_MOVE_ACCEL);
+              GATE_V_MAX, GATE_MOVE_ACCEL);
 }
 
 void sorter_test_start(uint8_t axis, uint8_t runs)
 {
     if (axis > 1 || runs == 0) return;
+
+    /* 清空挂起队列: 测试期间不响应普通运动命令 */
+    gq_head = gq_tail = gq_len = 0;
 
     stest[axis].runs_total = runs;
     stest[axis].run_idx = 0;
@@ -183,4 +324,8 @@ void sorter_poll(void)
             telemetry_line(axis);
         }
     }
+
+    /* 到位判定与队列推进(仅挡板轴) */
+    inpos_poll();
+    queue_poll();
 }

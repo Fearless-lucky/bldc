@@ -17,6 +17,8 @@ typedef struct {
     float    conv_kp;        /* 传送带速度环P */
     float    conv_ki;        /* 传送带速度环I */
     float    conv_kd;        /* 传送带速度环D */
+    float    adc_to_amp;     /* 电流标定系数(ADC码->安培) */
+    int32_t  enc_dir;        /* 挡板编码器方向(+1/-1) */
     uint32_t sum;            /* 简单校验和 */
 } ParamBlock_t;
 
